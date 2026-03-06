@@ -181,17 +181,176 @@ def list_record_files(record_id: int) -> list[dict]:
     return result, metadata
 
 
+def _verify_checksum(dest: Path, expected_checksum: str) -> bool:
+    """Verify file checksum. Returns True if valid."""
+    algo, expected_hash = (
+        expected_checksum.split(":", 1)
+        if ":" in expected_checksum
+        else ("md5", expected_checksum)
+    )
+    h = hashlib.new(algo)
+    with open(dest, "rb") as f:
+        while True:
+            block = f.read(CHUNK_SIZE)
+            if not block:
+                break
+            h.update(block)
+    actual = h.hexdigest()
+    if actual != expected_hash:
+        log.warning(f"Checksum mismatch for {dest.name}: expected {expected_hash}, got {actual}")
+        return False
+    log.info(f"Checksum verified: {dest.name}")
+    return True
+
+
+def _download_chunk(url: str, start: int, end: int, chunk_path: str,
+                    retries: int = MAX_RETRIES) -> bool:
+    """Download a single byte-range chunk."""
+    for attempt in range(1, retries + 1):
+        try:
+            headers = {"Range": f"bytes={start}-{end}"}
+            resp = requests.get(url, headers=headers, stream=True, timeout=120)
+            if resp.status_code not in (200, 206):
+                raise Exception(f"HTTP {resp.status_code}")
+
+            with open(chunk_path, "wb") as f:
+                for data in resp.iter_content(chunk_size=CHUNK_SIZE):
+                    f.write(data)
+            return True
+        except Exception as e:
+            if attempt < retries:
+                time.sleep(RETRY_DELAY * attempt)
+            else:
+                log.error(f"Chunk {start}-{end} failed after {retries} attempts: {e}")
+    return False
+
+
+def _download_parallel(url: str, dest_path: str, num_chunks: int = 8,
+                       retries: int = MAX_RETRIES) -> bool:
+    """
+    Download a file using parallel byte-range requests.
+    Splits the file into num_chunks pieces, downloads concurrently,
+    then reassembles. Requires server to support Range requests.
+    """
+    dest = Path(dest_path)
+
+    # First, get file size via HEAD
+    try:
+        head = requests.head(url, timeout=30, allow_redirects=True)
+        total_size = int(head.headers.get("content-length", 0))
+        accept_ranges = head.headers.get("accept-ranges", "none")
+    except Exception as e:
+        log.warning(f"HEAD request failed: {e}")
+        return False
+
+    if total_size == 0:
+        log.warning("Server didn't return content-length, can't parallelize")
+        return False
+
+    if accept_ranges == "none":
+        # Try anyway — many servers support ranges without advertising
+        log.info("Server doesn't advertise range support, attempting anyway...")
+
+    chunk_size = total_size // num_chunks
+    chunks = []
+    for i in range(num_chunks):
+        start = i * chunk_size
+        end = (i + 1) * chunk_size - 1 if i < num_chunks - 1 else total_size - 1
+        chunk_path = f"{dest_path}.part{i}"
+        chunks.append((start, end, chunk_path))
+
+    log.info(f"Parallel download: {num_chunks} chunks, {_human_size(total_size)} total")
+
+    # Download chunks in parallel
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    success = True
+    start_time = time.time()
+
+    if tqdm:
+        pbar = tqdm(total=total_size, unit="B", unit_scale=True,
+                    desc=dest.name[:40])
+    else:
+        pbar = None
+
+    with ThreadPoolExecutor(max_workers=num_chunks) as executor:
+        futures = {}
+        for start, end, chunk_path in chunks:
+            future = executor.submit(_download_chunk, url, start, end, chunk_path, retries)
+            futures[future] = (start, end, chunk_path)
+
+        for future in as_completed(futures):
+            start, end, chunk_path = futures[future]
+            if future.result():
+                actual_size = Path(chunk_path).stat().st_size
+                if pbar:
+                    pbar.update(actual_size)
+            else:
+                success = False
+                log.error(f"Chunk {start}-{end} failed")
+
+    if pbar:
+        pbar.close()
+
+    if not success:
+        # Clean up partial chunks
+        for _, _, chunk_path in chunks:
+            p = Path(chunk_path)
+            if p.exists():
+                p.unlink()
+        return False
+
+    # Reassemble chunks in order
+    log.info("Reassembling chunks...")
+    with open(dest, "wb") as outf:
+        for _, _, chunk_path in chunks:
+            cp = Path(chunk_path)
+            with open(cp, "rb") as inf:
+                while True:
+                    block = inf.read(CHUNK_SIZE)
+                    if not block:
+                        break
+                    outf.write(block)
+            cp.unlink()
+
+    elapsed = time.time() - start_time
+    speed = total_size / elapsed if elapsed > 0 else 0
+    log.info(f"Done: {_human_size(total_size)} in {elapsed:.1f}s ({_human_size(int(speed))}/s)")
+
+    # Verify reassembled size
+    final_size = dest.stat().st_size
+    if final_size != total_size:
+        log.error(f"Size mismatch: expected {total_size}, got {final_size}")
+        return False
+
+    return True
+
+
 def download_file(
     uri: str,
     dest_path: str,
     expected_checksum: str = None,
     retries: int = MAX_RETRIES,
+    parallel_chunks: int = 0,
 ) -> bool:
-    """Download a single file with retry, resume, and optional checksum verification."""
+    """Download a single file with retry, resume, and optional checksum verification.
+
+    If parallel_chunks > 0 and the server supports Range requests, downloads
+    the file in N parallel byte-range chunks to saturate high-bandwidth connections.
+    """
     dest = Path(dest_path)
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     url = uri if uri.startswith("http") else f"{FILE_BASE}{uri}"
+
+    # Try parallel chunked download if requested
+    if parallel_chunks > 1:
+        ok = _download_parallel(url, str(dest), parallel_chunks, retries)
+        if ok:
+            if expected_checksum:
+                return _verify_checksum(dest, expected_checksum)
+            return True
+        log.warning("Parallel download failed, falling back to sequential")
 
     for attempt in range(1, retries + 1):
         try:
@@ -351,7 +510,8 @@ def cmd_download(args):
     downloaded = []
     for f in files:
         dest = record_dir / f["key"]
-        ok = download_file(f["uri"], str(dest), f.get("checksum"))
+        ok = download_file(f["uri"], str(dest), f.get("checksum"),
+                           parallel_chunks=getattr(args, "parallel", 0))
         downloaded.append({**f, "downloaded": ok, "local_path": str(dest)})
 
     save_manifest(args.output, args.record, meta, downloaded)
@@ -447,6 +607,11 @@ Examples:
     --url http://opendata.cern.ch/record/12341/files/Run2012BC_DoubleMuParked_Muons.root \\
     --output ./cern_data
 
+  # Same thing but with 8 parallel chunks (saturate a fast connection)
+  python cern_downloader.py direct \\
+    --url http://opendata.cern.ch/record/12341/files/Run2012BC_DoubleMuParked_Muons.root \\
+    --output ./cern_data --parallel 8
+
   # Bulk download first 5 CMS datasets (dry run)
   python cern_downloader.py bulk --experiment CMS --type Dataset --limit 5 --dry-run
 
@@ -483,6 +648,8 @@ KEY RECORD IDS FOR PHYSICS ANALYSIS:
     sp.add_argument("--output", default=DEFAULT_OUTPUT)
     sp.add_argument("--ext", help="Comma-separated file extensions to filter, e.g. root,csv")
     sp.add_argument("--dry-run", action="store_true")
+    sp.add_argument("--parallel", type=int, default=0,
+                    help="Number of parallel chunks (0=sequential, 8-16 for fast connections)")
 
     # --- bulk ---
     sp = sub.add_parser("bulk", help="Search + download multiple records")
@@ -500,6 +667,8 @@ KEY RECORD IDS FOR PHYSICS ANALYSIS:
     sp.add_argument("--url", required=True, help="Direct HTTP/HTTPS URL to file")
     sp.add_argument("--output", default=DEFAULT_OUTPUT, help="Output directory")
     sp.add_argument("--filename", help="Override output filename")
+    sp.add_argument("--parallel", type=int, default=0,
+                    help="Number of parallel chunks (0=sequential, 8-16 for fast connections)")
 
     return parser
 
@@ -510,8 +679,11 @@ def cmd_direct(args):
     fname = args.filename or url.split("/")[-1]
     dest = Path(args.output) / fname
     print(f"\nDirect download: {url}")
-    print(f"  Destination: {dest}\n")
-    ok = download_file(url, str(dest))
+    print(f"  Destination: {dest}")
+    if args.parallel > 0:
+        print(f"  Parallel chunks: {args.parallel}")
+    print()
+    ok = download_file(url, str(dest), parallel_chunks=args.parallel)
     if ok:
         print(f"\nDone: {dest}  ({_human_size(dest.stat().st_size)})")
     else:
