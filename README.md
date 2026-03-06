@@ -249,7 +249,7 @@ If you use the tools or analysis from this repository:
   title = {Experimental Validation Bridge for Paper {V}: {Kaluza--Klein} Flavor Physics},
   year = {2026},
   publisher = {GitHub},
-  url = {https://github.com/kase1111-hash/paper-v-experimental-bridge}
+  url = {https://github.com/kase1111-hash/multikink-phenobridge}
 }
 ```
 
